@@ -22,16 +22,31 @@ void* handle_connection(void* arg) {
     int client_fd = data->client_fd;
     free(data);
 
-    // буфер маленький!!!
-
     // чтение строки HTTP-запроса и заголовков из сокета клиента 
     char buffer[BUFFER_SIZE];
-    ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer) - 1);
-    if (bytes_read <= 0) {
+    ssize_t bytes_read = 0;
+    ssize_t n;
+
+    // пока не получим конец заголовков "\r\n\r\n" или не заполнится буфер
+    while ((n = read(client_fd, buffer + bytes_read, sizeof(buffer) - 1 - bytes_read)) > 0) {
+        bytes_read += n;
+        buffer[bytes_read] = '\0';
+        if (strstr(buffer, "\r\n\r\n") != NULL) {
+            break; // получили все заголовки
+        }
+        if (bytes_read >= (ssize_t)(sizeof(buffer) - 1)) {
+            break; // буфер заполнен
+        }
+    }
+
+    if (n < 0 && bytes_read == 0) {
         close(client_fd);
         return NULL;
     }
-    buffer[bytes_read] = '\0';
+    if (bytes_read == 0) {
+        close(client_fd);
+        return NULL;
+    }
 
     // извлекаю имя хоста из строки заголовков 
     char* host_start = strstr(buffer, "Host: ");
@@ -59,7 +74,7 @@ void* handle_connection(void* arg) {
     strncpy(host, host_start, host_len); // копирую до host_len символов из host_start в host
     host[host_len] = '\0';
 
-    // чтобы прокси мог соединиться с конечным сервером ему нужно получить IP‑адрес + нужно создать сокет для соеденения с конечным сервером
+    // чтобы прокси мог соединиться с конечным сервером ему нужно получить IP-адрес + нужно создать сокет для соеденения с конечным сервером
     struct hostent* server = gethostbyname(host);
     if (!server) {
         // Ошибка 502 Bad Gateway: сервер, действуя как шлюз или прокси, получил недействительный ответ от вышестоящего сервера.
@@ -78,6 +93,7 @@ void* handle_connection(void* arg) {
 
     // настройка адреса сервера server_addr
     struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
     memcpy(&server_addr.sin_addr.s_addr, server->h_addr_list[0], server->h_length);
     server_addr.sin_family = AF_INET; // IPv4
     server_addr.sin_port = htons(port); // номер порта (в сетевом порядке байт) к которому будет привязан сокет
