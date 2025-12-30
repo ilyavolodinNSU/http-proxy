@@ -16,131 +16,156 @@ typedef struct {
     int client_fd;
 } thread_data_t;
 
-// функция для обработки соединения в отдельном потоке
+ssize_t read_request_headers(int fd, char *buf, size_t bufsize);
+int extract_host_from_headers(const char *headers, char *host, size_t hostsize);
+int resolve_and_connect(const char *host, int port);
+ssize_t forward_request(int server_fd, const char *buf, size_t len);
+void relay_response(int server_fd, int client_fd);
+
 void* handle_connection(void* arg) {
     thread_data_t* data = (thread_data_t*)arg;
     int client_fd = data->client_fd;
     free(data);
 
-    // чтение строки HTTP-запроса и заголовков из сокета клиента 
     char buffer[BUFFER_SIZE];
-    ssize_t bytes_read = 0;
-    ssize_t n;
-
-    // пока не получим конец заголовков "\r\n\r\n" или не заполнится буфер
-    while ((n = read(client_fd, buffer + bytes_read, sizeof(buffer) - 1 - bytes_read)) > 0) {
-        bytes_read += n;
-        buffer[bytes_read] = '\0';
-        if (strstr(buffer, "\r\n\r\n") != NULL) {
-            break; // получили все заголовки
-        }
-        if (bytes_read >= (ssize_t)(sizeof(buffer) - 1)) {
-            break; // буфер заполнен
-        }
-    }
-
-    if (n < 0 && bytes_read == 0) {
-        close(client_fd);
-        return NULL;
-    }
-    if (bytes_read == 0) {
+    ssize_t bytes_read = read_request_headers(client_fd, buffer, sizeof(buffer));
+    if (bytes_read <= 0) {
         close(client_fd);
         return NULL;
     }
 
-    // извлекаю имя хоста из строки заголовков 
-    char* host_start = strstr(buffer, "Host: ");
-    if (!host_start) {
+    char host[256];
+    int port = 80; // оставляем фиксированный порт, как в оригинале
+    if (extract_host_from_headers(buffer, host, sizeof(host)) != 0) {
         const char* msg = "HTTP/1.0 400 Bad Request\r\n\r\nInvalid request";
         write(client_fd, msg, strlen(msg));
         close(client_fd);
         return NULL;
     }
 
-    host_start += 6; // "Host: "
-    char* host_end = strstr(host_start, "\r\n");
-    if (!host_end) {
-        close(client_fd);
-        return NULL;
-    }
-
-    // извлекаю имя хоста и порт в host
-    char host[256];
-    int port = 80;
-    int host_len = host_end - host_start;
-    if (host_len > sizeof(host) - 1) {
-        host_len = sizeof(host) - 1;
-    }
-    strncpy(host, host_start, host_len); // копирую до host_len символов из host_start в host
-    host[host_len] = '\0';
-
-    // чтобы прокси мог соединиться с конечным сервером ему нужно получить IP-адрес + нужно создать сокет для соеденения с конечным сервером
-    struct hostent* server = gethostbyname(host);
-    if (!server) {
-        // Ошибка 502 Bad Gateway: сервер, действуя как шлюз или прокси, получил недействительный ответ от вышестоящего сервера.
+    int server_fd = resolve_and_connect(host, port);
+    if (server_fd < 0) {
         const char* msg = "HTTP/1.0 502 Bad Gateway\r\n\r\nHost resolution failed";
         write(client_fd, msg, strlen(msg));
         close(client_fd);
         return NULL;
     }
 
-    // создаю TCP сокет для соединения с конечным сервером
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        close(client_fd);
-        return NULL;
-    }
-
-    // настройка адреса сервера server_addr
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    memcpy(&server_addr.sin_addr.s_addr, server->h_addr_list[0], server->h_length);
-    server_addr.sin_family = AF_INET; // IPv4
-    server_addr.sin_port = htons(port); // номер порта (в сетевом порядке байт) к которому будет привязан сокет
-
-    // соединение с конечным сервером
-    if (connect(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+    if (forward_request(server_fd, buffer, (size_t)bytes_read) < 0) {
         close(server_fd);
         close(client_fd);
         return NULL;
     }
 
-    // пересылка запроса на конечный сервер
-    write(server_fd, buffer, bytes_read);
-
-    // пересылка ответа от конечного сервера клиенту
-    // когда сервер начнёт присылать данные прокси, я читаю их порциями и шлю обратно в client_fd
-    while (bytes_read = read(server_fd, buffer, sizeof(buffer))) {
-        if (bytes_read < 0) {
-            break;
-        }
-        
-        if (write(client_fd, buffer, bytes_read) < 0) {
-            break;
-        }
-    }
+    relay_response(server_fd, client_fd);
 
     close(server_fd);
     close(client_fd);
     return NULL;
 }
 
+// читает заголовки (до "\r\n\r\n") в буфер; возвращает количество байт или <=0 при ошибке
+ssize_t read_request_headers(int fd, char *buf, size_t bufsize) {
+    if (!buf || bufsize == 0) return -1;
+    ssize_t total = 0;
+    ssize_t n;
+
+    // читаем в цикл, пока не получим конец заголовков "\r\n\r\n" или не заполнится буфер
+    while ((n = read(fd, buf + total, bufsize - 1 - total)) > 0) {
+        total += n;
+        buf[total] = '\0';
+        if (strstr(buf, "\r\n\r\n") != NULL) {
+            break; // получили все заголовки
+        }
+        if (total >= (ssize_t)(bufsize - 1)) {
+            break; // буфер заполнен
+        }
+    }
+
+    if (n < 0 && total == 0) return -1;
+    return total;
+}
+
+// извлекает значение host: из заголовков, записывает в host (null-terminated)
+// возвращает 0 при успехе, -1 при ошибке
+int extract_host_from_headers(const char *headers, char *host, size_t hostsize) {
+    if (!headers || !host || hostsize == 0) return -1;
+    const char *h = strstr(headers, "Host: ");
+    if (!h) return -1;
+    h += 6; // пропускаем "Host: "
+    const char *h_end = strstr(h, "\r\n");
+    if (!h_end) return -1;
+    size_t len = (size_t)(h_end - h);
+    if (len >= hostsize) len = hostsize - 1;
+    // копируем и удаляем ведущие/хвостовые пробелы
+    size_t i = 0;
+    // пропускаем ведущие пробелы
+    while (i < len && (h[i] == ' ' || h[i] == '\t')) i++;
+    size_t start = i;
+    // находим реальную длину
+    size_t actual_len = len - start;
+    while (actual_len > 0 && (h[start + actual_len - 1] == ' ' || h[start + actual_len - 1] == '\t')) actual_len--;
+    if (actual_len >= hostsize) actual_len = hostsize - 1;
+    memcpy(host, h + start, actual_len);
+    host[actual_len] = '\0';
+    return 0;
+}
+
+// разрешает имя host и устанавливает соединение; возвращает fd сокета или -1 при ошибке
+int resolve_and_connect(const char *host, int port) {
+    struct hostent* server = gethostbyname(host);
+    if (!server) return -1;
+
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) return -1;
+
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    memcpy(&server_addr.sin_addr.s_addr, server->h_addr_list[0], server->h_length);
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+
+    if (connect(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        close(server_fd);
+        return -1;
+    }
+
+    return server_fd;
+}
+
+// форвардит уже прочитанные данные запроса на server_fd
+ssize_t forward_request(int server_fd, const char *buf, size_t len) {
+    if (!buf || len == 0) return 0;
+    ssize_t written = 0;
+    while ((size_t)written < len) {
+        ssize_t n = write(server_fd, buf + written, len - (size_t)written);
+        if (n < 0) return -1;
+        written += n;
+    }
+    return written;
+}
+
+// пересылает ответ от server_fd в client_fd
+void relay_response(int server_fd, int client_fd) {
+    char buffer[BUFFER_SIZE];
+    ssize_t n;
+    while ((n = read(server_fd, buffer, sizeof(buffer))) > 0) {
+        ssize_t sent = 0;
+        while (sent < n) {
+            ssize_t w = write(client_fd, buffer + sent, n - sent);
+            if (w <= 0) return;
+            sent += w;
+        }
+    }
+}
+
 int main() {
-    // создаем TCP сокет
-    /*
-    socket() создает сокет, возвращает дескриптор сокета
-        __domain - AF_INET - протокол IPv4
-        __type - SOCK_STREAM - TCP
-        __protocol - 0 - выбирается автоматически
-    */
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         printf("socket creation failed");
         exit(EXIT_FAILURE);
     }
 
-    // SOL_SOCKET - уровень на котором работает опция SO_REUSEADDR. работаем с опциями уровня сокета (не конкретно для какого-то протокола)
-    // SO_REUSEADDR позволяет переиспользовать порт сразу после завершения сервера. даже если он в состоянии TIME_WAIT
     int opt = 1;
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
         printf("setsockopt failed");
@@ -148,20 +173,17 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    // настройка адреса сервера server_addr
     struct sockaddr_in server_addr;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_family = AF_INET; // IP адрес к которому будет привязан сокет (IPv4)
-    server_addr.sin_port = htons(PORT); // номер порта 80 (в сетевом порядке байт) к которому будет привязан сокет
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(PORT);
 
-    // привязка сокета к адресу server_addr
     if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         printf("bind failed");
         close(server_fd);
         exit(EXIT_FAILURE);
     }
 
-    // начало прослушивания (5 потому что в мане прочитал что обычно <= 5)
     if (listen(server_fd, 5) < 0) {
         printf("listen failed");
         close(server_fd);
@@ -173,7 +195,7 @@ int main() {
     while (1) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
-        
+
         int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
         if (client_fd < 0) {
             printf("accept failed");
@@ -182,7 +204,6 @@ int main() {
 
         printf("новое подключение от %s:%d\n", inet_ntoa(client_addr.sin_addr), client_addr.sin_port);
 
-        // создаю поток (раньше был fork()) для обработки нового соединения
         pthread_t tid;
         thread_data_t* data = malloc(sizeof(thread_data_t));
         data->client_fd = client_fd;
